@@ -4,6 +4,7 @@
 
 import torch
 import torch.nn as nn
+import dataclasses
 
 from vllm.config.model import LogprobsMode
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -12,7 +13,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.ops.penalties import apply_all_penalties
-from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
+from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler, apply_top_k_top_p
 
 _SAMPLING_EPS = 1e-5
 
@@ -206,6 +207,70 @@ class Sampler(nn.Module):
     def compute_logprobs(logits: torch.Tensor) -> torch.Tensor:
         return logits.log_softmax(dim=-1, dtype=torch.float32)
 
+    def get_logprobs_for_gather(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        *,
+        force: bool = True,
+    ) -> torch.Tensor:
+        """
+        Return the distribution tensor that will be used by gather_logprobs().
+        - raw_logprobs: return log_softmax(original logits)
+        - processed_logprobs / processed_logits: run the same processing path as decode
+        (temperature/top-k/top-p/penalties/logits processors/...) and return processed tensor.
+        This function restores RNG state so it won't perturb actual decoding.
+        """
+
+        # 1) raw mode: keep exactly current semantics
+        if self.logprobs_mode == "raw_logprobs":
+            return self.compute_logprobs(logits)
+
+        # 2) processed mode: we need sample() to build the processed distribution.
+        #    Ensure sample() actually produces processed logprobs. In vLLM, processed
+        #    logprobs may be skipped if max_num_logprobs is None; for prompt_logprobs
+        #    we always want it, so "force" enables the path.
+        if force and getattr(sampling_metadata, "max_num_logprobs", None) is None:
+            sampling_metadata = dataclasses.replace(
+                sampling_metadata, max_num_logprobs=0
+            )
+
+        # Follow decode ordering: float32 -> logits processors -> sample()
+        logits_fp32 = logits.to(torch.float32)
+        logits_proc = self.apply_logits_processors(
+            logits_fp32,
+            sampling_metadata,
+            predict_bonus_token=False,
+        )
+
+        # sample() mutates logits in-place; clone to avoid side effects.
+        logits_for_sampling = logits_proc.clone()
+
+        # Snapshot RNG state so we don't perturb real decoding.
+        gen_states = None
+        if getattr(sampling_metadata, "generators", None):
+            gen_states = {k: g.get_state() for k, g in sampling_metadata.generators.items()}
+        try:
+            _, processed = self.sample(
+                logits_for_sampling,
+                sampling_metadata,
+                logprobs_mode_override=self.logprobs_mode,
+            )
+        finally:
+            if gen_states is not None:
+                for k, g in sampling_metadata.generators.items():
+                    st = gen_states.get(k)
+                    if st is not None:
+                        g.set_state(st)
+
+        # Defensive fallback: should not normally happen in processed_logprobs mode,
+        # but keeps behavior safe across edge branches.
+        if processed is None:
+            # If you later support processed_logits, you'd branch here accordingly.
+            processed = self.compute_logprobs(logits_proc)
+
+        return processed
+
     @staticmethod
     def gather_logprobs(
         logprobs: torch.Tensor,
@@ -317,3 +382,16 @@ class Sampler(nn.Module):
             sampling_metadata.repetition_penalties,
             output_token_ids,
         )
+
+def _snapshot_generators(generators: dict[int, torch.Generator] | None):
+    if not generators:
+        return None
+    return {k: g.get_state() for k, g in generators.items()}
+
+def _restore_generators(generators, states):
+    if not generators or states is None:
+        return
+    for k, g in generators.items():
+        st = states.get(k)
+        if st is not None:
+            g.set_state(st)

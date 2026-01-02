@@ -4039,28 +4039,42 @@ class GPUModelRunner(
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
+            tgt_token_ids_all = prompt_token_ids[start_tok : start_tok + num_logits]
 
-            # Get the "target" tokens for each index. For prompt at index i,
-            # the token at prompt index i+1 is the "sampled" token we want
-            # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
+            # Micro-batch size for prompt logprobs to avoid OOM in topk/topp (processed mode).
+            MB = 256
 
-            # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
+            sampling_metadata = self.input_batch.sampling_metadata
+            use_processed = getattr(self.sampler, "logprobs_mode", None) == "processed_logprobs"
 
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
+            for mb_start in range(0, num_logits, MB):
+                mb_end = min(num_logits, mb_start + MB)
+                hs_mb = prompt_hidden_states[mb_start:mb_end]
+                tgt_mb = tgt_token_ids_all[mb_start:mb_end]
+
+                logits_mb = self.model.compute_logits(hs_mb)
+
+                # IMPORTANT:
+                # raw_logprobs: compute_logprobs is OK
+                # processed_logprobs: get_logprobs_for_gather will run topk/topp but now batch is small
+                logprobs_mb = self.sampler.get_logprobs_for_gather(
+                    logits_mb, sampling_metadata, force=True
+                )
+
+                token_ids_mb, logprobs_top_mb, ranks_mb = self.sampler.gather_logprobs(
+                    logprobs_mb, num_prompt_logprobs, tgt_mb
+                )
+
+                chunk_slice = slice(start_idx + mb_start, start_idx + mb_end)
+                logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
+                    token_ids_mb, non_blocking=True
+                )
+                logprobs_tensors.logprobs[chunk_slice].copy_(
+                    logprobs_top_mb, non_blocking=True
+                )
+                logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
+                    ranks_mb, non_blocking=True
+                )
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.

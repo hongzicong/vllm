@@ -64,6 +64,23 @@ class Sampler:
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = self.process_logits(logits, sampling_metadata)
+
+        sampled = gumbel_sample(
+            logits,
+            sampling_metadata.temperature,
+            sampling_metadata.seeds,
+            sampling_metadata.pos,
+            apply_temperature=False,
+        )
+        return sampled, logits
+
+    # NEW(zicong): extracted from sample() to be reused in prompt logprobs computation
+    def process_logits(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> torch.Tensor:
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
 
@@ -76,12 +93,4 @@ class Sampler:
         logits = apply_top_k_top_p(
             logits, sampling_metadata.top_k, sampling_metadata.top_p
         )
-
-        sampled = gumbel_sample(
-            logits,
-            sampling_metadata.temperature,
-            sampling_metadata.seeds,
-            sampling_metadata.pos,
-            apply_temperature=False,
-        )
-        return sampled, logits
+        return logits

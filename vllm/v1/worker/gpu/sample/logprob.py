@@ -143,6 +143,7 @@ def compute_prompt_logprobs(
     prompt_token_ids: torch.Tensor,
     prompt_hidden_states: torch.Tensor,
     logits_fn: Callable[[torch.Tensor], torch.Tensor],
+    process_logits_fn: Callable[[torch.Tensor, int, int], torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,
     # we compute it in chunks.
@@ -154,6 +155,12 @@ def compute_prompt_logprobs(
         end_idx = start_idx + CHUNK_SIZE
         # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
         prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
+
+        # NEW(zicong): optionally apply the same "sampling-time" logit processing
+        # (temperature/top-p/top-k/penalties/...) before computing prompt logprobs.
+        if process_logits_fn is not None:
+            prompt_logits = process_logits_fn(prompt_logits, start_idx, end_idx)
+
         prompt_logprobs = compute_topk_logprobs(
             prompt_logits,
             0,  # num_logprobs
