@@ -13,9 +13,9 @@ from functools import reduce
 from itertools import product
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
+import dataclasses
 import numpy as np
 import torch
-import torch.distributed
 import torch.nn as nn
 from tqdm import tqdm
 
@@ -4039,28 +4039,78 @@ class GPUModelRunner(
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
+            tgt_token_ids_all = prompt_token_ids[start_tok : start_tok + num_logits]
 
-            # Get the "target" tokens for each index. For prompt at index i,
-            # the token at prompt index i+1 is the "sampled" token we want
-            # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
+            # Micro-batch size for prompt logprobs to avoid OOM in topk/topp (processed mode).
+            MB = 256
 
-            # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
+            sampling_metadata = self.input_batch.sampling_metadata
+            use_processed = getattr(self.sampler, "logprobs_mode", None) == "processed_logprobs"
 
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
+            def _expand_req_to_mb(x: torch.Tensor, req_row: int, mb_size: int) -> torch.Tensor:
+                # x: [num_reqs] -> [mb_size] by selecting one req and expanding
+                return x[req_row].expand(mb_size)
+
+            def _make_md_mb(md, req_row: int, mb_size: int):
+                """
+                Build a SamplingMetadata whose per-row tensors match logits_mb.shape[0] (=mb_size),
+                by taking the req_row-th entry and expanding it.
+                """
+                kwargs = {}
+
+                # These are the ones that MUST match logits_mb.shape[0] for processed_logprobs
+                if hasattr(md, "temperature") and isinstance(md.temperature, torch.Tensor):
+                    kwargs["temperature"] = _expand_req_to_mb(md.temperature, req_row, mb_size)
+                if hasattr(md, "top_p") and isinstance(md.top_p, torch.Tensor):
+                    kwargs["top_p"] = _expand_req_to_mb(md.top_p, req_row, mb_size)
+                if hasattr(md, "top_k") and isinstance(md.top_k, torch.Tensor):
+                    kwargs["top_k"] = _expand_req_to_mb(md.top_k, req_row, mb_size)
+                if hasattr(md, "min_p") and isinstance(md.min_p, torch.Tensor):
+                    kwargs["min_p"] = _expand_req_to_mb(md.min_p, req_row, mb_size)
+
+                # Penalties (safe even if all zeros / repetition_penalty=1.0)
+                if hasattr(md, "presence_penalties") and isinstance(md.presence_penalties, torch.Tensor):
+                    kwargs["presence_penalties"] = _expand_req_to_mb(md.presence_penalties, req_row, mb_size)
+                if hasattr(md, "frequency_penalties") and isinstance(md.frequency_penalties, torch.Tensor):
+                    kwargs["frequency_penalties"] = _expand_req_to_mb(md.frequency_penalties, req_row, mb_size)
+                if hasattr(md, "repetition_penalties") and isinstance(md.repetition_penalties, torch.Tensor):
+                    kwargs["repetition_penalties"] = _expand_req_to_mb(md.repetition_penalties, req_row, mb_size)
+
+                # These list fields are sometimes accessed by penalties/logits processors.
+                # Make them mb_size-length lists (same content repeated).
+                if hasattr(md, "output_token_ids") and isinstance(md.output_token_ids, list) and len(md.output_token_ids) > req_row:
+                    kwargs["output_token_ids"] = [md.output_token_ids[req_row] for _ in range(mb_size)]
+                if hasattr(md, "spec_token_ids") and isinstance(md.spec_token_ids, list) and len(md.spec_token_ids) > req_row:
+                    kwargs["spec_token_ids"] = [md.spec_token_ids[req_row] for _ in range(mb_size)]
+
+                # Deterministic processed_logprobs path should NOT need RNG/generators.
+                if hasattr(md, "generators"):
+                    kwargs["generators"] = {}
+
+                return dataclasses.replace(md, **kwargs)
+
+            for mb_start in range(0, num_logits, MB):
+                mb_end = min(num_logits, mb_start + MB)
+                hs_mb = prompt_hidden_states[mb_start:mb_end]
+                tgt_mb = tgt_token_ids_all[mb_start:mb_end]
+
+                logits_mb = self.model.compute_logits(hs_mb)
+
+                mb_size = mb_end - mb_start
+                md_mb = _make_md_mb(sampling_metadata, req_idx, mb_size) if use_processed else sampling_metadata
+
+                logprobs_mb = self.sampler.get_logprobs_for_gather(
+                    logits_mb, md_mb, force=True
+                )
+
+                token_ids_mb, logprobs_top_mb, ranks_mb = self.sampler.gather_logprobs(
+                    logprobs_mb, num_prompt_logprobs, tgt_mb
+                )
+
+                chunk_slice = slice(start_idx + mb_start, start_idx + mb_end)
+                logprobs_tensors.logprob_token_ids[chunk_slice].copy_(token_ids_mb, non_blocking=True)
+                logprobs_tensors.logprobs[chunk_slice].copy_(logprobs_top_mb, non_blocking=True)
+                logprobs_tensors.selected_token_ranks[chunk_slice].copy_(ranks_mb, non_blocking=True)
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.

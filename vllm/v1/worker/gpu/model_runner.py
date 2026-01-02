@@ -650,6 +650,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
+        sampling_metadata: SamplingMetadata | None = None,
     ) -> dict[str, LogprobsTensors]:
         idx_mapping_np = input_batch.idx_mapping_np
         needs_prompt_logprobs = self.req_states.needs_prompt_logprobs[idx_mapping_np]
@@ -697,11 +698,69 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # NOTE(woosuk): This triggers a GPU operation.
             token_ids[idx] = next_prompt_token
 
+        process_logits_fn = None
+
+        if (sampling_metadata is not None
+                and getattr(self.sampler, "logprobs_mode", None) == "processed_logprobs"):
+
+            # Build a mapping: each flattened token row -> request index (0..num_reqs-1)
+            # NOTE: build on CPU to avoid many tiny GPU ops.
+            row_to_req_cpu = np.empty(n, dtype=np.int64)
+            for i in range(len(input_batch.req_ids)):
+                start_idx = int(query_start_loc[i])
+                end_idx = int(query_start_loc[i + 1])
+                row_to_req_cpu[start_idx:end_idx] = i
+            row_to_req = torch.from_numpy(row_to_req_cpu).to(
+                device=hidden_states.device, non_blocking=True
+            )
+
+            def process_logits_fn(
+                logits_chunk: torch.Tensor,
+                start_idx: int,
+                end_idx: int,
+            ) -> torch.Tensor:
+                # logits_chunk: [chunk_rows, vocab]
+                # start/end are global row offsets in the flattened prompt-token space
+                rows = row_to_req[start_idx:end_idx]
+
+                # Construct per-row (per-token) sampling metadata by indexing per-request vectors.
+                # IMPORTANT: prompt_bin_mask/output_bin_counts stay un-sliced (they are per req_state),
+                # and penalties kernel uses idx_mapping to look up the correct req_state row.
+                sm = SamplingMetadata(
+                    temperature=sampling_metadata.temperature.index_select(0, rows),
+
+                    top_p=None if sampling_metadata.top_p is None
+                    else sampling_metadata.top_p.index_select(0, rows),
+                    top_k=None if sampling_metadata.top_k is None
+                    else sampling_metadata.top_k.index_select(0, rows),
+                    min_p=None if getattr(sampling_metadata, "min_p", None) is None
+                    else sampling_metadata.min_p.index_select(0, rows),
+
+                    repetition_penalty=sampling_metadata.repetition_penalty.index_select(0, rows),
+                    frequency_penalty=sampling_metadata.frequency_penalty.index_select(0, rows),
+                    presence_penalty=sampling_metadata.presence_penalty.index_select(0, rows),
+
+                    seeds=sampling_metadata.seeds.index_select(0, rows),
+                    pos=sampling_metadata.pos.index_select(0, rows),
+
+                    # We are NOT gathering topk logprobs here; only need processed logits for prompt logprob.
+                    max_num_logprobs=None,
+
+                    idx_mapping=sampling_metadata.idx_mapping.index_select(0, rows),
+                    prompt_bin_mask=sampling_metadata.prompt_bin_mask,
+                    output_bin_counts=sampling_metadata.output_bin_counts,
+                )
+
+                # Reuse GPU sampler’s processing pipeline (penalties/temp/min_p/topk/topp).
+                # sampler.process_logits returns processed_logits.
+                return self.sampler.process_logits(logits_chunk, sm)
+
         # NOTE(woosuk): We mask out logprobs for negative tokens.
         prompt_logprobs, prompt_ranks = compute_prompt_logprobs(
             token_ids,
             hidden_states[:n],
             self.model.compute_logits,
+            process_logits_fn=process_logits_fn,
         )
 
         prompt_token_ids = token_ids.unsqueeze(-1)
@@ -959,7 +1018,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, sampling_metadata, grammar_output
         )
-        prompt_logprobs_dict = self.compute_prompt_logprobs(hidden_states, input_batch)
+        prompt_logprobs_dict = self.compute_prompt_logprobs(
+            hidden_states, input_batch, sampling_metadata
+        )
 
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(

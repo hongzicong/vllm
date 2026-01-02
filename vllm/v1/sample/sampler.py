@@ -12,7 +12,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.ops.penalties import apply_all_penalties
-from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
+from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler, apply_top_k_top_p
 
 _SAMPLING_EPS = 1e-5
 
@@ -205,6 +205,61 @@ class Sampler(nn.Module):
     @staticmethod
     def compute_logprobs(logits: torch.Tensor) -> torch.Tensor:
         return logits.log_softmax(dim=-1, dtype=torch.float32)
+
+    def get_logprobs_for_gather(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        *,
+        force: bool = True,
+    ) -> torch.Tensor:
+        """
+        Return the distribution tensor that will be used by gather_logprobs().
+
+        - raw_logprobs: log_softmax(original logits)
+        - processed_logprobs: deterministically apply the same processing path as decode:
+            float32 -> logits processors (bad words / penalties / non-argmax-invariant)
+            -> temperature -> argmax-invariant processors -> top-k/top-p mask -> log_softmax
+        (NO sampling, NO RNG)
+        """
+
+        # 1) raw mode
+        if self.logprobs_mode == "raw_logprobs":
+            return self.compute_logprobs(logits)
+
+        # 2) processed_* mode: deterministic (no sample)
+        logits_fp32 = logits.to(torch.float32)
+
+        # Apply bad words / non-argmax-invariant processors / penalties
+        logits_proc = self.apply_logits_processors(
+            logits_fp32,
+            sampling_metadata,
+            predict_bonus_token=False,
+        )
+
+        # Temperature (in-place)
+        logits_proc = self.apply_temperature(
+            logits_proc,
+            sampling_metadata.temperature,
+            sampling_metadata.all_random,
+        )
+
+        # Apply argmax-invariant processors (same as decode path)
+        for processor in sampling_metadata.logitsprocs.argmax_invariant:
+            logits_proc = processor.apply(logits_proc)
+
+        # Apply top-k/top-p filtering deterministically (mask logits to -inf)
+        # NOTE: apply_top_k_top_p may be in-place or return logits; handle both.
+        maybe = apply_top_k_top_p(
+            logits_proc,
+            sampling_metadata.top_k,
+            sampling_metadata.top_p,
+        )
+        if maybe is not None:
+            logits_proc = maybe
+
+        # Return processed logprobs
+        return self.compute_logprobs(logits_proc)
 
     @staticmethod
     def gather_logprobs(
