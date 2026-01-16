@@ -144,7 +144,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
-from vllm.v1.sample.sampler import Sampler
+from vllm.v1.sample.sampler import MinPLogitsProcessor, Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -4065,8 +4065,6 @@ class GPUModelRunner(
                     kwargs["top_p"] = _expand_req_to_mb(md.top_p, req_row, mb_size)
                 if hasattr(md, "top_k") and isinstance(md.top_k, torch.Tensor):
                     kwargs["top_k"] = _expand_req_to_mb(md.top_k, req_row, mb_size)
-                if hasattr(md, "min_p") and isinstance(md.min_p, torch.Tensor):
-                    kwargs["min_p"] = _expand_req_to_mb(md.min_p, req_row, mb_size)
 
                 # Penalties (safe even if all zeros / repetition_penalty=1.0)
                 if hasattr(md, "presence_penalties") and isinstance(md.presence_penalties, torch.Tensor):
@@ -4083,9 +4081,51 @@ class GPUModelRunner(
                 if hasattr(md, "spec_token_ids") and isinstance(md.spec_token_ids, list) and len(md.spec_token_ids) > req_row:
                     kwargs["spec_token_ids"] = [md.spec_token_ids[req_row] for _ in range(mb_size)]
 
+                if hasattr(md, "prompt_token_ids") and isinstance(md.prompt_token_ids, list) and len(md.prompt_token_ids) > req_row:
+                    kwargs["prompt_token_ids"] = [md.prompt_token_ids[req_row] for _ in range(mb_size)]
+
+                if hasattr(md, "bad_words_token_ids") and isinstance(md.bad_words_token_ids, list) and len(md.bad_words_token_ids) > req_row:
+                    kwargs["bad_words_token_ids"] = [md.bad_words_token_ids[req_row] for _ in range(mb_size)]
+
+                if hasattr(md, "allowed_token_ids_mask") and isinstance(md.allowed_token_ids_mask, torch.Tensor):
+                    m = md.allowed_token_ids_mask
+                    if m.dim() >= 1 and m.shape[0] > req_row:
+                        kwargs["allowed_token_ids_mask"] = m[req_row: req_row + 1].expand(mb_size, *m.shape[1:])
+
                 # Deterministic processed_logprobs path should NOT need RNG/generators.
                 if hasattr(md, "generators"):
                     kwargs["generators"] = {}
+                
+                # ---- IMPORTANT: expand MinPLogitsProcessor.min_p to [mb_size] ----
+                if hasattr(md, "logitsprocs") and md.logitsprocs is not None:
+                    lp = md.logitsprocs
+                    lp_mb = copy(lp)
+
+                    new_ai = []
+                    for proc in lp.argmax_invariant:
+                        if isinstance(proc, MinPLogitsProcessor):
+                            p = copy(proc)
+
+                            mp_full = proc.min_p  # tensor slice (可能是 [B] 或 [:0])
+                            if mp_full.numel() == 0 or getattr(proc, "min_p_count", 0) == 0:
+                                p.min_p = mp_full[:0]
+                                p.min_p_count = 0
+                            else:
+                                mp_one = mp_full[req_row:req_row+1]
+                                if mp_one.numel() == 0:
+                                    p.min_p = mp_full[:0]
+                                    p.min_p_count = 0
+                                else:
+                                    mp_val = mp_one[0]
+                                    p.min_p = mp_val.view(1, 1).expand(mb_size, 1)
+                                    p.min_p_count = 1 if float(mp_val) > 0.0 else 0
+
+                            new_ai.append(p)
+                        else:
+                            new_ai.append(proc)
+
+                    lp_mb.argmax_invariant = new_ai
+                    kwargs["logitsprocs"] = lp_mb
 
                 return dataclasses.replace(md, **kwargs)
 
@@ -4098,6 +4138,12 @@ class GPUModelRunner(
 
                 mb_size = mb_end - mb_start
                 md_mb = _make_md_mb(sampling_metadata, req_idx, mb_size) if use_processed else sampling_metadata
+
+                for f in dataclasses.fields(md_mb):
+                    v = getattr(md_mb, f.name)
+                    if isinstance(v, torch.Tensor) and v.dim() >= 1:
+                        if v.shape[0] not in (0, mb_size):
+                            raise RuntimeError(f"SamplingMetadata tensor {f.name} has batch {v.shape[0]} != {mb_size}")
 
                 logprobs_mb = self.sampler.get_logprobs_for_gather(
                     logits_mb, md_mb, force=True

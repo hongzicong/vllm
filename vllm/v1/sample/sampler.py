@@ -13,7 +13,11 @@ from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler, apply_top_k_top_p
-
+from vllm.v1.sample.logits_processor.builtin import (
+    MinPLogitsProcessor, 
+    LogitBiasLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 _SAMPLING_EPS = 1e-5
 
 
@@ -228,14 +232,54 @@ class Sampler(nn.Module):
             return self.compute_logprobs(logits)
 
         # 2) processed_* mode: deterministic (no sample)
-        logits_fp32 = logits.to(torch.float32)
+        logits_proc = logits.to(torch.float32).clone()
 
-        # Apply bad words / non-argmax-invariant processors / penalties
-        logits_proc = self.apply_logits_processors(
-            logits_fp32,
-            sampling_metadata,
-            predict_bonus_token=False,
-        )
+        # allowed mask
+        if sampling_metadata.allowed_token_ids_mask is not None:
+            logits_proc.masked_fill_(sampling_metadata.allowed_token_ids_mask, float("-inf"))
+
+        # bad words
+        if sampling_metadata.bad_words_token_ids:
+            apply_bad_words(logits_proc,
+                            sampling_metadata.bad_words_token_ids,
+                            sampling_metadata.output_token_ids)
+
+        if sampling_metadata.logitsprocs.non_argmax_invariant:
+            for proc in sampling_metadata.logitsprocs.non_argmax_invariant:
+                # ---- 1) min_tokens：当 min_tokens==0 时是 no-op，别 raise
+                if isinstance(proc, MinTokensLogitsProcessor):
+                    mt = getattr(sampling_metadata, "min_tokens", 0)
+
+                    is_zero = False
+                    if isinstance(mt, torch.Tensor):
+                        is_zero = bool(torch.all(mt == 0).item())
+                    else:
+                        is_zero = (mt == 0)
+
+                    if is_zero:
+                        continue
+
+                    raise RuntimeError(
+                        "processed prompt_logprobs: MinTokensLogitsProcessor is active (min_tokens>0). "
+                        "Need stateless implementation or force per-token decode path."
+                    )
+
+                # ---- 2) logit_bias：当 bias 为空时 no-op；否则可以直接 apply（前提：md_mb batch 已扩展对）
+                if LogitBiasLogitsProcessor and isinstance(proc, LogitBiasLogitsProcessor):
+                    lb = getattr(sampling_metadata, "logit_bias", None)
+                    if lb is None or (isinstance(lb, dict) and len(lb) == 0):
+                        continue
+                    logits_proc = proc.apply(logits_proc)
+                    continue
+
+                # ---- 3) 其他未知 non-argmax-invariant：先别 silent skip，直接报出类型
+                raise RuntimeError(
+                    f"processed prompt_logprobs: unsupported non-argmax-invariant processor: {type(proc)}"
+                )
+    
+        # penalties（如果你确实需要 decode 等价）
+        logits_proc = self.apply_penalties(logits_proc, sampling_metadata, sampling_metadata.output_token_ids)
+
 
         # Temperature (in-place)
         logits_proc = self.apply_temperature(
@@ -244,7 +288,6 @@ class Sampler(nn.Module):
             sampling_metadata.all_random,
         )
 
-        # Apply argmax-invariant processors (same as decode path)
         for processor in sampling_metadata.logitsprocs.argmax_invariant:
             logits_proc = processor.apply(logits_proc)
 
